@@ -20,6 +20,7 @@ from .views import (
     BuscadorViewSet,          # Asumiendo que esta vista existe
 )
 
+from .chatbot_view import chatbot_view
 # Crea una instancia del DefaultRouter de Django REST Framework
 # para generar automáticamente las URLs para tus ViewSets
 router = DefaultRouter()
@@ -55,4 +56,6 @@ urlpatterns = [
     path('buscar-asignaturas/', BuscadorViewSet.as_view({'get': 'buscar_asignaturas'}), name='buscar-asignaturas'),
     # Ejemplo: /api/notificaciones/enviar_masiva/
     path('notificaciones/enviar_masiva/', NotificacionViewSet.as_view({'post': 'enviar_masiva'}), name='notificaciones-enviar-masiva'),
+
+    path('chatbot/', chatbot_view, name='chatbot'),
 ]
