@@ -27,10 +27,10 @@ from .models import Horario, Asignatura, Programa, Salon, Usuario
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDZyeTIprDhHeZ27csKdcLhoizrNzs5A6Y")
+GEMINI_API_KEY = os.environ.get("Gemini API Key 2", "GEMINI_API_KEY")  # reemplaza con tu API Key real en producción
 GEMINI_MODEL   = "gemini-flash-latest"   # mismo modelo que el cURL que funciona
 GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models"
+    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
     f"/{GEMINI_MODEL}:generateContent"
 )
 
