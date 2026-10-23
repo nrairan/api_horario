@@ -140,4 +140,54 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 AUTH_USER_MODEL = 'api_app.Usuario'
-CORS_ALLOW_ALL_ORIGINS= True
+CORS_ALLOW_ALL_ORIGINS = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN DE HORARIOS (ajustable sin modificar la lógica de validación)
+# ─────────────────────────────────────────────────────────────────────────────
+# Estos valores representan las reglas académicas institucionales de PGC_MCS.
+# Pueden sobreescribirse mediante variables de entorno (ver ejemplos).
+#
+# Ejemplo de sobreescritura en .env / entorno del servidor:
+#   HORARIO_MAX_CLASES_DIA=5
+#   HORARIO_MAX_HORAS_DIA=10
+#   HORARIO_DURACION_MIN_H=2
+#   HORARIO_DURACION_MAX_H=3
+#   HORARIO_JORNADA_INICIO=7
+#   HORARIO_JORNADA_FIN=18
+import os as _os
+
+_env_file = BASE_DIR / '.env'
+if _env_file.is_file():
+    for _line in _env_file.read_text(encoding='utf-8').splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            _key, _value = _line.split('=', 1)
+            _value = _value.strip().strip('"').strip("'")
+            _os.environ.setdefault(_key.strip(), _value)
+
+HORARIO_CONFIG = {
+    # Máximo de clases que un gestor puede impartir en un mismo día
+    'MAX_CLASES_DIA': int(_os.environ.get('HORARIO_MAX_CLASES_DIA', 4)),
+
+    # Máximo de horas (totales) que un gestor puede impartir en un mismo día.
+    # Valor predeterminado: 8 horas (no existe norma institucional documentada;
+    # se elige un límite razonable que puede ajustarse sin tocar el código).
+    'MAX_HORAS_DIA': int(_os.environ.get('HORARIO_MAX_HORAS_DIA', 8)),
+
+    # Duración mínima y máxima de una clase, en horas
+    'DURACION_MIN_H': int(_os.environ.get('HORARIO_DURACION_MIN_H', 2)),
+    'DURACION_MAX_H': int(_os.environ.get('HORARIO_DURACION_MAX_H', 3)),
+
+    # Jornada académica (horas en formato 24 h)
+    'JORNADA_INICIO': int(_os.environ.get('HORARIO_JORNADA_INICIO', 7)),
+    'JORNADA_FIN':    int(_os.environ.get('HORARIO_JORNADA_FIN', 18)),
+
+    # CAI (Campos de Aprendizaje Institucional / Núcleos temáticos con horario fijo predefinido)
+    # Lista de códigos de asignaturas consideradas CAI
+    'CAI_ASIGNATURAS': _os.environ.get('HORARIO_CAI_ASIGNATURAS', '').split(',') if _os.environ.get('HORARIO_CAI_ASIGNATURAS') else [],
+
+    # Franjas predefinidas fijas para asignaturas CAI específicas (código -> franja)
+    # Ejemplo: 'CAI101': {'dia': 'VIE', 'hora_inicio': '08:00:00', 'hora_fin': '11:00:00'}
+    'CAI_HORARIOS_PREDEFINIDOS': {},
+}

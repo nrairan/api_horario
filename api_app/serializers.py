@@ -113,14 +113,13 @@ class SalonSerializer(serializers.ModelSerializer):
         return value
 
 
-# === Serializer para Horario (con validaciones de tiempo) ===
+# === Serializer para Horario (validaciones centralizadas en services/validacion_horarios.py) ===
 class HorarioSerializer(serializers.ModelSerializer):
-    # salon es opcional: Flutter no lo envía; se asigna automáticamente
-    # al primer salón disponible o se puede omitir si no hay salones aún.
+    # Soporte obligatorio de asignación y validación del salón
     salon = serializers.PrimaryKeyRelatedField(
         queryset=Salon.objects.all(),
-        required=False,
-        allow_null=True,
+        required=True,
+        allow_null=False,
     )
 
     # semestre es opcional al crear (se llena desde Flutter al guardar)
@@ -134,38 +133,68 @@ class HorarioSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, data):
-        hora_inicio = data.get('hora_inicio')
-        hora_fin    = data.get('hora_fin')
+        """
+        Delega todas las validaciones de negocio al servicio centralizado.
+        Se ejecuta tanto en create() como en update() / partial_update().
 
-        if hora_inicio and hora_fin:
-            # Validación: Hora fin > Hora inicio
-            if hora_fin <= hora_inicio:
-                raise serializers.ValidationError("La hora de fin debe ser mayor a la de inicio.")
+        Durante una actualización, self.instance contiene el horario que
+        se está editando y se excluye explícitamente mediante exclude(pk=self.instance.pk)
+        para que el horario no colisione consigo mismo.
+        """
+        from api_app.services.validacion_horarios import validar_horario
 
-            # Validación: Duración entre 2 y 3 horas
-            inicio_td = timedelta(hours=hora_inicio.hour, minutes=hora_inicio.minute)
-            fin_td    = timedelta(hours=hora_fin.hour,    minutes=hora_fin.minute)
-            duracion  = fin_td - inicio_td
+        # En actualizaciones (PUT/PATCH), los campos omitidos toman el valor
+        # de la instancia existente para poder validar el bloque completo.
+        if self.instance is not None:
+            hora_inicio = data.get('hora_inicio', self.instance.hora_inicio)
+            hora_fin    = data.get('hora_fin', self.instance.hora_fin)
+            asignatura  = data.get('asignatura', self.instance.asignatura)
+            gestor      = data.get('gestor', self.instance.gestor)
+            dia         = data.get('dia', self.instance.dia)
+            semestre    = data.get('semestre', self.instance.semestre)
+            salon       = data.get('salon', self.instance.salon)
+            excluir_id  = self.instance.pk
+            instancia   = self.instance
+        else:
+            hora_inicio = data.get('hora_inicio')
+            hora_fin    = data.get('hora_fin')
+            asignatura  = data.get('asignatura')
+            gestor      = data.get('gestor')
+            dia         = data.get('dia')
+            semestre    = data.get('semestre', '')
+            salon       = data.get('salon')
+            excluir_id  = None
+            instancia   = None
 
-            if not (timedelta(hours=2) <= duracion <= timedelta(hours=3)):
-                raise serializers.ValidationError("La clase debe durar entre 2 y 3 horas.")
+        if salon is None:
+            raise serializers.ValidationError({
+                'salon': 'El campo salon es obligatorio y no puede ser nulo.'
+            })
 
-            # Validación: Horario entre 7:00 a.m. y 6:00 p.m.
-            if hora_inicio < time(7, 0) or hora_fin > time(18, 0):
-                raise serializers.ValidationError("Las clases deben ser entre 7:00 a.m. y 6:00 p.m.")
+        conflictos = validar_horario(
+            asignatura  = asignatura,
+            salon       = salon,
+            gestor      = gestor,
+            dia         = dia,
+            hora_inicio = hora_inicio,
+            hora_fin    = hora_fin,
+            semestre    = semestre,
+            excluir_id  = excluir_id,
+            instancia   = instancia,
+        )
+
+        if conflictos:
+            raise serializers.ValidationError({
+                'conflictos': conflictos,
+            })
 
         return data
 
     def create(self, validated_data):
-        # Si no viene salon, asignar el primero disponible automáticamente
         if 'salon' not in validated_data or validated_data.get('salon') is None:
-            salon = Salon.objects.first()
-            if salon:
-                validated_data['salon'] = salon
-            else:
-                raise serializers.ValidationError(
-                    "No hay salones registrados. Crea al menos un salón antes de guardar horarios."
-                )
+            raise serializers.ValidationError({
+                'salon': 'El campo salon es obligatorio y no puede ser nulo.'
+            })
         return super().create(validated_data)
 
 

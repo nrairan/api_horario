@@ -11,9 +11,11 @@ Endpoint: POST /api/chatbot/
 """
 
 import json
+import hashlib
 import os
 import requests
 
+from django.core.cache import cache
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -27,12 +29,9 @@ from .models import Horario, Asignatura, Programa, Salon, Usuario
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get("Gemini API Key 2", "GEMINI_API_KEY")  # reemplaza con tu API Key real en producción
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = "gemini-flash-latest"   # mismo modelo que el cURL que funciona
-GEMINI_URL     = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
-    f"/{GEMINI_MODEL}:generateContent"
-)
+GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,13 +215,33 @@ def chatbot_view(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    if not GEMINI_API_KEY:
+        return Response(
+            {"ok": False, "error": "El chatbot no tiene configurada la clave GEMINI_API_KEY."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
     # Construir historial en formato Gemini
     contents = []
-    for turn in history[-20:]:           # máximo 20 turnos para no saturar
+    recent_history = history[-20:]
+    for turn in recent_history:           # máximo 20 turnos para no saturar
         role = turn.get("role", "user")
         text = turn.get("text", "")
         if role in ("user", "model") and text:
             contents.append({"role": role, "parts": [{"text": text}]})
+
+    cache_key = None
+    if request.user.is_authenticated or not recent_history:
+        cache_scope = f"user:{request.user.pk}" if request.user.is_authenticated else "public"
+        cache_data = json.dumps(
+            {"model": GEMINI_MODEL, "scope": cache_scope, "message": user_message, "history": recent_history},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cache_key = f"chatbot:{hashlib.sha256(cache_data.encode('utf-8')).hexdigest()}"
+        cached_reply = cache.get(cache_key)
+        if cached_reply is not None:
+            return Response({"ok": True, "reply": cached_reply})
 
     # Agregar el mensaje actual
     contents.append({"role": "user", "parts": [{"text": user_message}]})
@@ -233,7 +252,7 @@ def chatbot_view(request):
         },
         "contents": contents,
         "generationConfig": {
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 512,
             "temperature":     0.3,
         },
     }
@@ -243,7 +262,7 @@ def chatbot_view(request):
             GEMINI_URL,
             headers={
                 "Content-Type": "application/json",
-                "X-goog-api-key": GEMINI_API_KEY,   # igual que el cURL
+                "X-goog-api-key": GEMINI_API_KEY,
             },
             json=payload,
             timeout=30,
@@ -251,12 +270,35 @@ def chatbot_view(request):
         resp.raise_for_status()
         data  = resp.json()
         reply = data["candidates"][0]["content"]["parts"][0]["text"]
+        if cache_key:
+            cache.set(cache_key, reply, timeout=300)
         return Response({"ok": True, "reply": reply})
 
     except requests.exceptions.Timeout:
         return Response(
             {"ok": False, "error": "Tiempo de espera agotado con Gemini."},
             status=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+    except requests.exceptions.HTTPError as e:
+        upstream_status = e.response.status_code if e.response is not None else None
+        if upstream_status == status.HTTP_429_TOO_MANY_REQUESTS:
+            return Response(
+                {"ok": False, "error": "Gemini alcanzó el límite de cuota o solicitudes. Revisa la cuota y facturación del proyecto de Google, o espera a que se restablezca el límite."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        if upstream_status == status.HTTP_503_SERVICE_UNAVAILABLE:
+            return Response(
+                {"ok": False, "error": "Gemini no está disponible temporalmente. Intenta de nuevo en unos minutos."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(
+            {"ok": False, "error": f"Gemini rechazó la solicitud (HTTP {upstream_status or 'desconocido'})."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+    except requests.exceptions.RequestException:
+        return Response(
+            {"ok": False, "error": "No fue posible conectar con Gemini."},
+            status=status.HTTP_502_BAD_GATEWAY,
         )
     except Exception as e:
         return Response(
