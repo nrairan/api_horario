@@ -27,7 +27,7 @@ from rest_framework.test import APITestCase, APIClient
 from rest_framework import status
 from datetime import time
 
-from .models import Usuario, Programa, Asignatura, Salon, Horario
+from .models import Usuario, Programa, Asignatura, Salon, Horario, RegistroAuditoria
 from .services.validacion_horarios import (
     validar_horario,
     validar_duracion_y_jornada,
@@ -325,7 +325,7 @@ class TestDuracionJornada(HorarioTestBase):
         url = reverse('horario-list')
         resp = self.client.post(url, self.payload(
             hora_inicio='07:00:00',
-            hora_fin='08:00:00',
+            hora_fin='07:30:00',
         ), format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
 
@@ -429,30 +429,33 @@ class TestActualizacionHorario(HorarioTestBase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSemestres(HorarioTestBase):
-    def test_mismo_salon_diferentes_semestres_no_choca(self):
-        """
-        Un horario de un semestre anterior (ej. '2024-1') no debe bloquear la
-        programación de un nuevo semestre (ej. '2024-2') en el mismo salón y hora.
-        """
-        self.crear_horario_db(semestre='2024-1')
-        url = reverse('horario-list')
-        resp = self.client.post(url, self.payload(
+    """
+    El campo `semestre` es el semestre de la malla (1-9), no el periodo académico.
+    Un salón o un gestor es único: NO puede estar en dos semestres a la vez.
+    """
+    def _tipos(self, resp):
+        return [c['tipo'] for c in resp.data['conflictos']]
+
+    def test_mismo_salon_diferentes_semestres_choca(self):
+        self.crear_horario_db(semestre='1')
+        resp = self.client.post(reverse('horario-list'), self.payload(
             gestor=self.gestor2.pk,
             asignatura=self.asignatura2.pk,
-            semestre='2024-2',
+            semestre='2',
         ), format='json')
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
-        self.assertEqual(Horario.objects.count(), 2)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('SALON_OCUPADO', self._tipos(resp))
+        self.assertEqual(Horario.objects.count(), 1)
 
-    def test_mismo_gestor_diferentes_semestres_no_choca(self):
-        """El gestor puede tener asignada la misma franja en semestres/periodos distintos."""
-        self.crear_horario_db(semestre='2024-1')
-        url = reverse('horario-list')
-        resp = self.client.post(url, self.payload(
+    def test_mismo_gestor_diferentes_semestres_choca(self):
+        self.crear_horario_db(semestre='1')
+        resp = self.client.post(reverse('horario-list'), self.payload(
             salon=self.salon2.pk,
-            semestre='2024-2',
+            asignatura=self.asignatura2.pk,
+            semestre='2',
         ), format='json')
-        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('GESTOR_OCUPADO', self._tipos(resp))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -634,7 +637,7 @@ class TestHorarioInvalidoNoSeGuarda(HorarioTestBase):
         url = reverse('horario-list')
         resp = self.client.post(url, self.payload(
             hora_inicio='07:00:00',
-            hora_fin='08:00:00',
+            hora_fin='07:30:00',
         ), format='json')
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(Horario.objects.count(), 0)
@@ -683,9 +686,363 @@ class TestServicioValidacion(HorarioTestBase):
         )
         self.assertEqual(conflictos, [])
 
-    def test_registros_distintos_semestres_no_colisionan(self):
-        self.crear_horario_db(hora_inicio=time(7, 0), hora_fin=time(9, 0), semestre='2024-1')
+    def test_registros_distintos_semestres_si_colisionan(self):
+        self.crear_horario_db(hora_inicio=time(7, 0), hora_fin=time(9, 0), semestre='1')
         conflictos = validar_salon_disponible(
-            self.salon1, 'LUN', time(7, 0), time(9, 0), semestre='2024-2'
+            self.salon1, 'LUN', time(7, 0), time(9, 0), semestre='2'
         )
-        self.assertEqual(conflictos, [])
+        self.assertTrue(any(c['tipo'] == 'SALON_OCUPADO' for c in conflictos))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pruebas de Auditoría y Estadísticas
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAuditoriaEndpoints(HorarioTestBase):
+    def setUp(self):
+        super().setUp()
+        self.usuario_ti = Usuario.objects.create_user(
+            username='tecnico_ti',
+            email='ti@ucundinamarca.edu.co',
+            password='Password123',
+            rol='TI',
+            first_name='Laura',
+            last_name='Gómez',
+        )
+        self.estudiante = Usuario.objects.create_user(
+            username='estudiante1',
+            email='est1@ucundinamarca.edu.co',
+            password='Password123',
+            rol='ES',
+        )
+        self.coordinador2 = Usuario.objects.create_user(
+            username='coord2',
+            email='coord2@ucundinamarca.edu.co',
+            password='Coord456',
+            rol='CO',
+        )
+        self.programa2 = Programa.objects.create(
+            nombre='Ingeniería Ambiental',
+            codigo='IAMB',
+            coordinador=self.coordinador2,
+        )
+        self.asignatura_prog2 = Asignatura.objects.create(
+            codigo='AMB101',
+            nombre='Ecología',
+            programa=self.programa2,
+            creditos=3,
+        )
+
+    def test_auditoria_acceso_no_autenticado_denegado(self):
+        resp = self.client.get('/api/auditoria/')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_auditoria_acceso_rol_no_permitido_denegado(self):
+        self.client.force_authenticate(user=self.estudiante)
+        resp = self.client.get('/api/auditoria/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=self.gestor1)
+        resp = self.client.get('/api/auditoria/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_auditoria_ti_ve_todos_los_registros(self):
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=1,
+            descripcion='Horario 1',
+        )
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador2,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=2,
+            descripcion='Horario 2',
+        )
+
+        self.client.force_authenticate(user=self.usuario_ti)
+        resp = self.client.get('/api/auditoria/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 2)
+
+    def test_auditoria_coordinador_ve_solo_su_programa(self):
+        h1 = self.crear_horario_db(asignatura=self.asignatura1)
+        h2 = self.crear_horario_db(asignatura=self.asignatura_prog2, hora_inicio=time(9, 0), hora_fin=time(11, 0))
+
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=h1.id,
+            descripcion='Horario de Prog 1',
+        )
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador2,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=h2.id,
+            descripcion='Horario de Prog 2',
+        )
+
+        self.client.force_authenticate(user=self.coordinador)
+        resp = self.client.get('/api/auditoria/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 1)
+        self.assertEqual(resp.data['results'][0]['objeto_id'], h1.id)
+
+    def test_auditoria_paginacion(self):
+        self.client.force_authenticate(user=self.usuario_ti)
+        for i in range(15):
+            RegistroAuditoria.objects.create(
+                usuario=self.usuario_ti,
+                accion='CREATE',
+                modelo='Horario',
+                objeto_id=i + 1,
+                descripcion=f'Registro {i}',
+            )
+
+        resp = self.client.get('/api/auditoria/?limit=5&offset=5')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['count'], 15)
+        self.assertEqual(len(resp.data['results']), 5)
+        self.assertIsNotNone(resp.data['next'])
+        self.assertIsNotNone(resp.data['previous'])
+
+    def test_auditoria_ultimos_5_cambios(self):
+        self.client.force_authenticate(user=self.usuario_ti)
+        for i in range(10):
+            RegistroAuditoria.objects.create(
+                usuario=self.usuario_ti,
+                accion='CREATE',
+                modelo='Horario',
+                objeto_id=i + 1,
+                descripcion=f'Registro {i}',
+            )
+
+        resp = self.client.get('/api/auditoria/ultimos/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(resp.data, list)
+        self.assertEqual(len(resp.data), 5)
+        self.assertEqual(resp.data[0]['objeto_id'], 10)
+
+    def test_auditoria_estadisticas_formato_graficos(self):
+        self.client.force_authenticate(user=self.usuario_ti)
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=1,
+        )
+        RegistroAuditoria.objects.create(
+            usuario=self.usuario_ti,
+            accion='UPDATE',
+            modelo='Horario',
+            objeto_id=1,
+        )
+
+        resp = self.client.get('/api/auditoria/estadisticas/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.data
+        self.assertIn('cambios_por_periodo', data)
+        self.assertIn('cambios_por_accion', data)
+        self.assertIn('cambios_por_modelo', data)
+        self.assertIn('cambios_por_usuario', data)
+        self.assertIn('cambios_por_rol', data)
+        self.assertIn('estado_horarios', data)
+        self.assertIn('total_registros', data)
+        self.assertEqual(data['total_registros'], 2)
+
+    def test_auditoria_estadisticas_filtro_periodo(self):
+        self.client.force_authenticate(user=self.usuario_ti)
+        RegistroAuditoria.objects.create(
+            usuario=self.coordinador,
+            accion='CREATE',
+            modelo='Horario',
+            objeto_id=1,
+        )
+
+        resp_dia = self.client.get('/api/auditoria/estadisticas/?periodo=dia')
+        self.assertEqual(resp_dia.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(resp_dia.data['cambios_por_periodo']) >= 1)
+
+        resp_sem = self.client.get('/api/auditoria/estadisticas/?periodo=semana')
+        self.assertEqual(resp_sem.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(resp_sem.data['cambios_por_periodo']) >= 1)
+
+    def test_ciclo_vida_horario_registra_auditoria(self):
+        self.client.force_authenticate(user=self.coordinador)
+
+        # 1. CREATE
+        url = reverse('horario-list')
+        resp = self.client.post(url, self.payload(), format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        horario_id = resp.data['id']
+
+        log_create = RegistroAuditoria.objects.filter(
+            modelo='Horario', objeto_id=horario_id, accion='CREATE'
+        ).first()
+        self.assertIsNotNone(log_create)
+        self.assertEqual(log_create.usuario, self.coordinador)
+
+        # 2. UPDATE
+        url_detail = reverse('horario-detail', kwargs={'pk': horario_id})
+        resp = self.client.put(url_detail, self.payload(salon=self.salon2.pk), format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        log_update = RegistroAuditoria.objects.filter(
+            modelo='Horario', objeto_id=horario_id, accion='UPDATE'
+        ).first()
+        self.assertIsNotNone(log_update)
+        self.assertIsNotNone(log_update.datos_antes)
+        self.assertIsNotNone(log_update.datos_despues)
+
+        # 3. DELETE
+        resp = self.client.delete(url_detail)
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+        log_delete = RegistroAuditoria.objects.filter(
+            modelo='Horario', objeto_id=horario_id, accion='DELETE'
+        ).first()
+        self.assertIsNotNone(log_delete)
+        self.assertEqual(log_delete.objeto_id, horario_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. Restricciones del documento (grupo, horas, tipo de aula, 40 h, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from .models import Matricula
+
+
+class TestRestriccionesDocumento(HorarioTestBase):
+    def _post(self, **kw):
+        return self.client.post(reverse('horario-list'), self.payload(**kw), format='json')
+
+    def _tipos(self, resp):
+        return [c['tipo'] for c in resp.data['conflictos']]
+
+    # -- cruce de GRUPO ------------------------------------------------------
+    def test_cruce_de_grupo_mismo_semestre_y_programa(self):
+        self.crear_horario_db()                       # asig1, gestor1, salon1, LUN 7-9, sem 1
+        resp = self._post(asignatura=self.asignatura2.pk, gestor=self.gestor2.pk,
+                          salon=self.salon2.pk)       # recursos distintos, mismo grupo
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self._tipos(resp), ['GRUPO_OCUPADO'])
+
+    def test_otro_semestre_con_recursos_distintos_no_choca(self):
+        self.crear_horario_db()
+        resp = self._post(asignatura=self.asignatura2.pk, gestor=self.gestor2.pk,
+                          salon=self.salon2.pk, semestre='2')
+        self.assertEqual(resp.status_code, 201, getattr(resp, 'data', None))
+
+    # -- horas por semana de la asignatura ----------------------------------
+    def test_no_supera_horas_semana_de_la_asignatura(self):
+        self.asignatura1.horas_semana = 4
+        self.asignatura1.save()
+        self.assertEqual(self._post().status_code, 201)                       # 2 h
+        self.assertEqual(self._post(dia='MAR').status_code, 201)              # 4 h
+        resp = self._post(dia='MIE')                                          # 6 h > 4
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('HORAS_ASIGNATURA_EXCEDIDAS', self._tipos(resp))
+
+    def test_editar_bloque_no_cuenta_dos_veces_sus_horas(self):
+        self.asignatura1.horas_semana = 2
+        self.asignatura1.save()
+        h = self.crear_horario_db()
+        resp = self.client.put(reverse('horario-detail', args=[h.pk]),
+                               self.payload(dia='MAR'), format='json')
+        self.assertEqual(resp.status_code, 200, getattr(resp, 'data', None))
+
+    def test_horas_semana_cero_no_bloquea_pero_advierte(self):
+        resp = self.client.post(reverse('horario-validar'), self.payload(), format='json')
+        self.assertTrue(resp.data['valido'])
+        self.assertIn('HORAS_NO_DEFINIDAS', [a['tipo'] for a in resp.data['advertencias']])
+
+    # -- tipo de aula --------------------------------------------------------
+    def test_nucleo_de_computo_exige_sala_de_computo(self):
+        self.asignatura1.requiere_sala_computo = True
+        self.asignatura1.save()
+        resp = self._post()                                   # salon1 es AULA
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('TIPO_AULA_INCORRECTO', self._tipos(resp))
+        sala = Salon.objects.create(codigo='SC1', capacidad=30, edificio='G', tipo='COMP')
+        self.assertEqual(self._post(salon=sala.pk).status_code, 201)
+
+    # -- capacidad y tamaño de grupo ----------------------------------------
+    def _matricular(self, n, asignatura=None):
+        asignatura = asignatura or self.asignatura1
+        for i in range(n):
+            est = Usuario.objects.create_user(
+                username=f'est{asignatura.pk}_{i}', password='Abc12345', rol='ES',
+                email=f'e{asignatura.pk}_{i}@ucundinamarca.edu.co')
+            Matricula.objects.create(estudiante=est, asignatura=asignatura, semestre='1')
+
+    def test_capacidad_insuficiente(self):
+        self._matricular(26)
+        resp = self._post(salon=self.salon2.pk)               # capacidad 25
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('CAPACIDAD_INSUFICIENTE', self._tipos(resp))
+
+    def test_grupo_fuera_de_8_a_35_solo_advierte(self):
+        self._matricular(5)
+        resp = self.client.post(reverse('horario-validar'), self.payload(), format='json')
+        self.assertTrue(resp.data['valido'])
+        self.assertIn('GRUPO_BAJO_MINIMO', [a['tipo'] for a in resp.data['advertencias']])
+
+    # -- 40 h semanales por gestor ------------------------------------------
+    def test_limite_40_horas_semanales_por_gestor(self):
+        # 5 días x 8 h = 40 h para gestor1 (varios núcleos/semestres para no chocar)
+        for i, dia in enumerate(['LUN', 'MAR', 'MIE', 'JUE', 'VIE']):
+            for j, (ini, fin) in enumerate([(7, 10), (10, 13), (14, 16)]):   # 3+3+2 = 8 h
+                asig = Asignatura.objects.create(codigo=f'X{i}{j}', nombre=f'N{i}{j}',
+                                                 programa=self.programa, creditos=2)
+                self.crear_horario_db(asignatura=asig, dia=dia, semestre=str(j + 3),
+                                      hora_inicio=time(ini, 0), hora_fin=time(fin, 0),
+                                      salon=Salon.objects.create(codigo=f'S{i}{j}', capacidad=30,
+                                                                 edificio='Z'))
+        resp = self._post(dia='LUN', hora_inicio='16:00:00', hora_fin='17:00:00',
+                          asignatura=self.asignatura2.pk, semestre='1')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('LIMITE_HORAS_SEMANA', self._tipos(resp))
+
+    # -- días y semestre ------------------------------------------------------
+    def test_sabado_solo_para_cai(self):
+        resp = self._post(dia='SAB')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('DIA_NO_PERMITIDO', self._tipos(resp))
+
+    def test_semestre_debe_coincidir_con_el_del_nucleo(self):
+        self.asignatura1.semestre = '3'
+        self.asignatura1.save()
+        resp = self._post(semestre='1')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('SEMESTRE_NO_COINCIDE', self._tipos(resp))
+        self.assertEqual(self._post(semestre='3').status_code, 201)
+
+    # -- restricciones blandas ----------------------------------------------
+    def test_advierte_almuerzo_y_ventana_sin_bloquear(self):
+        self.crear_horario_db(hora_inicio=time(7, 0), hora_fin=time(9, 0))
+        resp = self.client.post(reverse('horario-validar'), self.payload(
+            asignatura=self.asignatura2.pk, gestor=self.gestor2.pk, salon=self.salon2.pk,
+            hora_inicio='12:00:00', hora_fin='14:00:00'), format='json')
+        self.assertTrue(resp.data['valido'], resp.data)
+        tipos = [a['tipo'] for a in resp.data['advertencias']]
+        self.assertIn('ALMUERZO_INVADIDO', tipos)
+        self.assertIn('VENTANA_HORARIA', tipos)
+
+    def test_validar_acepta_excluir_id_y_devuelve_resumen(self):
+        h = self.crear_horario_db()
+        resp = self.client.post(reverse('horario-validar'),
+                                self.payload(excluir_id=h.pk), format='json')
+        self.assertTrue(resp.data['valido'], resp.data)
+        self.assertIn('horas_semana_gestor', resp.data['resumen'])
+
+    # -- asignatura: horas obligatorias al crear ----------------------------
+    def test_asignatura_exige_horas_semana_al_crear(self):
+        base = {'codigo': 'N1', 'nombre': 'Nuevo', 'programa': self.programa.pk,
+                'creditos': 3, 'semestre': '1', 'gestores': []}
+        self.assertEqual(self.client.post(reverse('asignatura-list'), base, format='json').status_code, 400)
+        base['horas_semana'] = 4
+        self.assertEqual(self.client.post(reverse('asignatura-list'), base, format='json').status_code, 201)
