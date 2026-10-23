@@ -4,7 +4,8 @@ from datetime import time, timedelta
 from .models import (
     Usuario, Programa, Asignatura, Salon,
     Horario, Matricula, Notificacion,
-    NotificacionUsuario, ConfiguracionUsuario
+    NotificacionUsuario, ConfiguracionUsuario,
+    RegistroAuditoria,
 )
 
 # === Serializer para Usuario (Custom User) ===
@@ -77,12 +78,38 @@ class AsignaturaSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Asignatura
-        fields = ['id', 'codigo', 'nombre', 'programa', 'gestores', 'creditos', 'semestre']
+        fields = [
+            'id', 'codigo', 'nombre', 'programa', 'gestores', 'creditos', 'semestre',
+            'horas_semana', 'requiere_sala_computo', 'horas_asignadas',
+        ]
+
+    # Horas ya programadas en Horario (solo lectura; la app muestra "asignadas de N")
+    horas_asignadas = serializers.SerializerMethodField()
+
+    def get_horas_asignadas(self, obj):
+        minutos = sum(
+            (h.hora_fin.hour * 60 + h.hora_fin.minute) - (h.hora_inicio.hour * 60 + h.hora_inicio.minute)
+            for h in obj.horario_set.all()
+        )
+        return round(minutos / 60, 2)
 
     def validate_creditos(self, value):
         if value < 1 or value > 6:
             raise serializers.ValidationError("Los créditos deben estar entre 1 y 6.")
         return value
+
+    def validate_horas_semana(self, value):
+        if value > 40:
+            raise serializers.ValidationError("Las horas por semana no pueden superar 40.")
+        return value
+
+    def validate(self, data):
+        # Al CREAR un núcleo las horas semanales son obligatorias (>= 1).
+        if self.instance is None and (data.get('horas_semana') or 0) < 1:
+            raise serializers.ValidationError(
+                {'horas_semana': 'Indica cuántas horas por semana lleva el núcleo (mínimo 1).'}
+            )
+        return data
 
     def create(self, validated_data):
         # ManyToMany no se puede pasar directo al create(), se maneja aparte
@@ -105,7 +132,7 @@ class AsignaturaSerializer(serializers.ModelSerializer):
 class SalonSerializer(serializers.ModelSerializer):
     class Meta:
         model = Salon
-        fields = ['id', 'codigo', 'capacidad', 'edificio']
+        fields = ['id', 'codigo', 'capacidad', 'edificio', 'tipo']
 
     def validate_capacidad(self, value):
         if value < 10:
@@ -141,7 +168,7 @@ class HorarioSerializer(serializers.ModelSerializer):
         se está editando y se excluye explícitamente mediante exclude(pk=self.instance.pk)
         para que el horario no colisione consigo mismo.
         """
-        from api_app.services.validacion_horarios import validar_horario
+        from api_app.services.validacion_horarios import evaluar_horario, semestre_efectivo
 
         # En actualizaciones (PUT/PATCH), los campos omitidos toman el valor
         # de la instancia existente para poder validar el bloque completo.
@@ -171,7 +198,7 @@ class HorarioSerializer(serializers.ModelSerializer):
                 'salon': 'El campo salon es obligatorio y no puede ser nulo.'
             })
 
-        conflictos = validar_horario(
+        resultado = evaluar_horario(
             asignatura  = asignatura,
             salon       = salon,
             gestor      = gestor,
@@ -183,11 +210,15 @@ class HorarioSerializer(serializers.ModelSerializer):
             instancia   = instancia,
         )
 
-        if conflictos:
+        # Solo las restricciones DURAS bloquean el guardado; las blandas
+        # (almuerzo, ventanas, carga equilibrada) se consultan en /horarios/validar/.
+        if resultado['errores']:
             raise serializers.ValidationError({
-                'conflictos': conflictos,
+                'conflictos': resultado['errores'],
             })
 
+        # El semestre del bloque es el del núcleo cuando el cliente no lo envía.
+        data['semestre'] = semestre_efectivo(asignatura, semestre)
         return data
 
     def create(self, validated_data):
@@ -248,3 +279,23 @@ class ConfiguracionUsuarioSerializer(serializers.ModelSerializer):
         model = ConfiguracionUsuario
         fields = ['id', 'usuario', 'tema_oscuro']
         read_only_fields = ['usuario']
+
+# === Serializer para Registro de Auditoría ===
+class RegistroAuditoriaSerializer(serializers.ModelSerializer):
+    usuario_nombre = serializers.SerializerMethodField()
+    accion_display = serializers.CharField(source='get_accion_display', read_only=True)
+
+    class Meta:
+        model = RegistroAuditoria
+        fields = [
+            'id', 'fecha', 'usuario', 'usuario_nombre', 'accion',
+            'accion_display', 'modelo', 'objeto_id', 'descripcion',
+            'datos_antes', 'datos_despues', 'ip',
+        ]
+        read_only_fields = fields
+
+    def get_usuario_nombre(self, obj):
+        if obj.usuario:
+            nombre = obj.usuario.get_full_name().strip()
+            return nombre if nombre else obj.usuario.username
+        return 'Sistema'

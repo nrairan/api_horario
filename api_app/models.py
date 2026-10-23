@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 
+
 class Usuario(AbstractUser):
     ROLES = (
         ('CO', 'Coordinador de Programa'),
@@ -58,6 +59,12 @@ class Asignatura(models.Model):
         blank=True,                        # ← CAMBIO CLAVE
     )
     creditos  = models.PositiveSmallIntegerField()
+    # Horas de clase por semana que debe llevar el núcleo (horas reloj).
+    # 0 = "sin definir" (registros anteriores); el formulario exige >= 1.
+    # El validador impide programar más horas que estas por semana.
+    horas_semana = models.PositiveSmallIntegerField(default=0)
+    # True si el núcleo debe dictarse en sala de cómputo.
+    requiere_sala_computo = models.BooleanField(default=False)
     # ↓ Semestre al que pertenece el núcleo temático (ej. "1", "2", ... "10")
     semestre  = models.CharField(max_length=10, blank=True, default='')
 
@@ -66,9 +73,15 @@ class Asignatura(models.Model):
 
 
 class Salon(models.Model):
+    TIPOS = (
+        ('AULA', 'Aula convencional'),
+        ('COMP', 'Sala de cómputo'),
+    )
+
     codigo    = models.CharField(max_length=20, unique=True)
     capacidad = models.PositiveSmallIntegerField()
     edificio  = models.CharField(max_length=50)
+    tipo      = models.CharField(max_length=4, choices=TIPOS, default='AULA')
 
     def __str__(self):
         return self.codigo
@@ -81,6 +94,8 @@ class Horario(models.Model):
         ('MIE', 'Miércoles'),
         ('JUE', 'Jueves'),
         ('VIE', 'Viernes'),
+        # Sábado solo se admite para núcleos CAI (ver DIAS_REGULARES en settings).
+        ('SAB', 'Sábado'),
     )
 
     asignatura  = models.ForeignKey(Asignatura, on_delete=models.CASCADE)
@@ -177,3 +192,71 @@ class ConfiguracionUsuario(models.Model):
 
     def __str__(self):
         return f"Configuración de {self.usuario}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUDITORÍA
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RegistroAuditoria(models.Model):
+    """
+    Registro de auditoría para rastrear creaciones, actualizaciones y
+    eliminaciones en los modelos principales del sistema (Horario, Asignatura,
+    Matricula, Usuario, etc.).
+
+    Se alimenta automáticamente mediante la función de utilidad
+    `api_app.utils.registrar_auditoria()`, que debe invocarse desde los
+    ViewSets en los métodos create(), update() y destroy().
+
+    Roles con acceso de lectura:
+      - TI  (Técnico de Soporte): ve todos los registros.
+      - CO  (Coordinador de Programa): ve los registros de su programa.
+    """
+
+    ACCIONES = (
+        ('CREATE', 'Creación'),
+        ('UPDATE', 'Actualización'),
+        ('DELETE', 'Eliminación'),
+        ('LOGIN',  'Inicio de sesión'),
+        ('OTHER',  'Otro'),
+    )
+
+    # Quién realizó la acción (null si fue una operación del sistema)
+    usuario       = models.ForeignKey(
+        Usuario,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='auditoria',
+    )
+    # Qué tipo de acción
+    accion        = models.CharField(max_length=10, choices=ACCIONES, default='OTHER')
+    # Sobre qué modelo (ej. "Horario", "Asignatura")
+    modelo        = models.CharField(max_length=50)
+    # ID del objeto afectado
+    objeto_id     = models.PositiveIntegerField(null=True, blank=True)
+    # Descripción legible del cambio
+    descripcion   = models.TextField(blank=True, default='')
+    # Datos previos al cambio (JSON) — útil para comparación
+    datos_antes   = models.JSONField(null=True, blank=True)
+    # Datos posteriores al cambio (JSON)
+    datos_despues = models.JSONField(null=True, blank=True)
+    # IP desde la que se realizó la acción
+    ip            = models.GenericIPAddressField(null=True, blank=True)
+    # Cuándo ocurrió (indexado para consultas eficientes)
+    fecha         = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-fecha']
+        verbose_name = 'Registro de auditoría'
+        verbose_name_plural = 'Registros de auditoría'
+        indexes = [
+            models.Index(fields=['-fecha']),
+            models.Index(fields=['modelo', '-fecha']),
+            models.Index(fields=['usuario', '-fecha']),
+            models.Index(fields=['accion', '-fecha']),
+        ]
+
+    def __str__(self):
+        user_str = str(self.usuario) if self.usuario else 'Sistema'
+        return f"[{self.fecha:%Y-%m-%d %H:%M}] {user_str} – {self.get_accion_display()} en {self.modelo}"
