@@ -24,6 +24,16 @@ from .views import (
 from .chatbot_view import chatbot_view
 
 router = DefaultRouter()
+router.register(r'admin/usuarios', UsuarioViewSet, basename='admin-usuarios')
+router.register(r'admin/programas', ProgramaViewSet, basename='admin-programas')
+router.register(r'admin/salones', SalonViewSet, basename='admin-salones')
+router.register(r'admin/asignaturas', AsignaturaViewSet, basename='admin-asignaturas')
+
+urlpatterns = [
+    path('api/', include(router.urls)),
+]
+
+router = DefaultRouter()
 
 router.register(r'usuarios',            UsuarioViewSet,             basename='usuario')
 router.register(r'matricula',           MatriculaViewSet,           basename='matricula')

@@ -10,7 +10,8 @@ from .models import (
 
 # === Serializer para Usuario (Custom User) ===
 class UsuarioSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True)
+    # Obligatoria al crear; al editar solo se cambia si se envía.
+    password = serializers.CharField(write_only=True, required=False)
 
     class Meta:
         model = Usuario
@@ -35,14 +36,50 @@ class UsuarioSerializer(serializers.ModelSerializer):
     def validate_email(self, value):
         if not value.endswith('@ucundinamarca.edu.co'):
             raise serializers.ValidationError("Debe usar un correo institucional de la Universidad de Cundinamarca.")
+        # El login busca por correo: no puede haber dos usuarios con el mismo.
+        qs = Usuario.objects.filter(email__iexact=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Ya existe un usuario con ese correo.")
         return value
+
+    def validate(self, data):
+        if self.instance is None and not data.get('password'):
+            raise serializers.ValidationError({'password': 'Este campo es obligatorio.'})
+
+        # No se puede cambiar el rol de un usuario con registros ligados a su rol actual.
+        nuevo = data.get('rol')
+        if self.instance is not None and nuevo and nuevo != self.instance.rol:
+            from api_app.services.dependencias import (
+                dependencias_usuario, DEPENDENCIAS_POR_ROL, describir,
+            )
+            deps = dependencias_usuario(self.instance)
+            bloqueantes = {k: v for k, v in deps.items()
+                           if k in DEPENDENCIAS_POR_ROL.get(self.instance.rol, ())}
+            if bloqueantes:
+                raise serializers.ValidationError({
+                    'rol': f'No se puede cambiar el rol: el usuario tiene {describir(bloqueantes)}.'
+                })
+        return data
 
     def create(self, validated_data):
         password = validated_data.pop('password')
+        m2m = {k: validated_data.pop(k) for k in ('groups', 'user_permissions') if k in validated_data}
         user = Usuario.objects.create(**validated_data)
         user.set_password(password)
         user.save()
+        for campo, valores in m2m.items():
+            getattr(user, campo).set(valores)
         return user
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop('password', None)
+        instance = super().update(instance, validated_data)
+        if password:  # hash, nunca texto plano
+            instance.set_password(password)
+            instance.save(update_fields=['password'])
+        return instance
 
 
 # === Serializer para Programa ===
@@ -138,6 +175,26 @@ class SalonSerializer(serializers.ModelSerializer):
         if value < 10:
             raise serializers.ValidationError("La capacidad mínima es 10.")
         return value
+
+    def validate(self, data):
+        # Al editar un salón con horarios, no se puede dejar incompatible con ellos.
+        if self.instance is not None:
+            capacidad = data.get('capacidad', self.instance.capacidad)
+            tipo = data.get('tipo', self.instance.tipo)
+            problemas = []
+            for h in Horario.objects.filter(salon=self.instance).select_related('asignatura'):
+                a = h.asignatura
+                inscritos = Matricula.objects.filter(asignatura=a).count()
+                if inscritos > capacidad:
+                    problemas.append(f'"{a.codigo}" tiene {inscritos} matriculados (capacidad {capacidad})')
+                if a.requiere_sala_computo and tipo != 'COMP':
+                    problemas.append(f'"{a.codigo}" requiere sala de cómputo')
+            if problemas:
+                raise serializers.ValidationError({
+                    'salon': 'El cambio es incompatible con horarios existentes: '
+                             + '; '.join(sorted(set(problemas))) + '.'
+                })
+        return data
 
 
 # === Serializer para Horario (validaciones centralizadas en services/validacion_horarios.py) ===
@@ -237,18 +294,22 @@ class MatriculaSerializer(serializers.ModelSerializer):
         fields = ['id', 'estudiante', 'asignatura', 'semestre']
 
     def validate(self, data):
+        # Funciona para crear, PUT y PATCH (en PATCH faltan campos: se toman de la instancia).
+        inst = self.instance
+        estudiante = data.get('estudiante', getattr(inst, 'estudiante', None))
+        asignatura = data.get('asignatura', getattr(inst, 'asignatura', None))
+        semestre   = data.get('semestre',   getattr(inst, 'semestre', None))
+
+        previas = Matricula.objects.all()
+        if inst is not None:
+            previas = previas.exclude(pk=inst.pk)   # no compararse consigo misma
+
         # Validación: Estudiante no puede repetir asignatura
-        if Matricula.objects.filter(
-            estudiante=data['estudiante'],
-            asignatura=data['asignatura']
-        ).exists():
+        if previas.filter(estudiante=estudiante, asignatura=asignatura).exists():
             raise serializers.ValidationError("El estudiante ya está matriculado en esta asignatura.")
 
         # Validación: Límite de 8 asignaturas por semestre
-        if Matricula.objects.filter(
-            estudiante=data['estudiante'],
-            semestre=data['semestre']
-        ).count() >= 8:
+        if previas.filter(estudiante=estudiante, semestre=semestre).count() >= 8:
             raise serializers.ValidationError("El estudiante no puede matricular más de 8 asignaturas por semestre.")
 
         return data

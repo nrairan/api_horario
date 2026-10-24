@@ -22,6 +22,72 @@ from .serializers import (
 )
 from django.contrib.auth import authenticate
 from api_app.utils import registrar_auditoria
+from api_app.permissions import IsTIOrReadOnly, MatriculaPermission
+from api_app.services.dependencias import (
+    dependencias_usuario, dependencias_programa, dependencias_asignatura,
+    dependencias_salon, describir,
+)
+
+
+class AdminCRUDMixin:
+    """
+    Comportamiento común de las entidades administrativas:
+      - auditoría de CREATE / UPDATE / DELETE (quién, cuándo, antes/después);
+      - DELETE bloqueado con 409 si hay registros dependientes (no se borra en cascada);
+    Cada ViewSet define `modelo_auditoria` y, si aplica, `dependencias(obj)`.
+    """
+    modelo_auditoria = ''
+
+    def dependencias(self, obj) -> dict:
+        return {}
+
+    def _etiqueta(self, obj):
+        return str(obj)
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        obj = serializer.save()
+        registrar_auditoria(
+            request=self.request, accion='CREATE', modelo=self.modelo_auditoria,
+            objeto_id=obj.pk, descripcion=f'{self.modelo_auditoria} creado: {self._etiqueta(obj)}',
+            datos_despues=dict(self.get_serializer(obj).data),
+        )
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        antes = dict(self.get_serializer(serializer.instance).data)
+        obj = serializer.save()
+        registrar_auditoria(
+            request=self.request, accion='UPDATE', modelo=self.modelo_auditoria,
+            objeto_id=obj.pk, descripcion=f'{self.modelo_auditoria} actualizado: {self._etiqueta(obj)}',
+            datos_antes=antes, datos_despues=dict(self.get_serializer(obj).data),
+        )
+
+    def _bloqueo(self, obj, request):
+        """Devuelve un Response 409 si la eliminación no es segura; si no, None."""
+        dep = self.dependencias(obj)
+        if dep:
+            return Response({
+                'error': f'No se puede eliminar: tiene registros asociados ({describir(dep)}).',
+                'codigo': 'ELIMINACION_BLOQUEADA',
+                'dependencias': dep,
+            }, status=status.HTTP_409_CONFLICT)
+        return None
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        obj = self.get_object()
+        bloqueo = self._bloqueo(obj, request)
+        if bloqueo is not None:
+            return bloqueo
+        antes, obj_id, etiqueta = dict(self.get_serializer(obj).data), obj.pk, self._etiqueta(obj)
+        self.perform_destroy(obj)
+        registrar_auditoria(
+            request=request, accion='DELETE', modelo=self.modelo_auditoria,
+            objeto_id=obj_id, descripcion=f'{self.modelo_auditoria} eliminado: {etiqueta}',
+            datos_antes=antes,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ─────────────────────────────────────────────
@@ -45,38 +111,59 @@ class IsEstudiante(permissions.BasePermission):
 # USUARIOS
 # ─────────────────────────────────────────────
 
-class UsuarioViewSet(viewsets.ModelViewSet):
+class UsuarioViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
     serializer_class = UsuarioSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsTIOrReadOnly]
+    modelo_auditoria = 'Usuario'
 
     def get_queryset(self):
-        queryset = Usuario.objects.all()
+        queryset = Usuario.objects.all().order_by('id')
         rol = self.request.query_params.get('rol')
         if rol:
             queryset = queryset.filter(rol=rol)
         return queryset
+
+    def dependencias(self, obj):
+        return dependencias_usuario(obj)
+
+    def _bloqueo(self, obj, request):
+        if obj.pk == request.user.pk:
+            return Response({
+                'error': 'No puedes eliminar tu propia cuenta.',
+                'codigo': 'ELIMINACION_BLOQUEADA',
+                'dependencias': {},
+            }, status=status.HTTP_409_CONFLICT)
+        return super()._bloqueo(obj, request)
 
 
 # ─────────────────────────────────────────────
 # PROGRAMAS
 # ─────────────────────────────────────────────
 
-class ProgramaViewSet(viewsets.ModelViewSet):
-    queryset = Programa.objects.all()
+class ProgramaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
+    queryset = Programa.objects.all().order_by('id')
     serializer_class = ProgramaSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsTIOrReadOnly]
+    modelo_auditoria = 'Programa'
+
+    def dependencias(self, obj):
+        return dependencias_programa(obj)
 
 
 # ─────────────────────────────────────────────
 # ASIGNATURAS
 # ─────────────────────────────────────────────
 
-class AsignaturaViewSet(viewsets.ModelViewSet):
+class AsignaturaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
     serializer_class = AsignaturaSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsTIOrReadOnly]
+    modelo_auditoria = 'Asignatura'
+
+    def dependencias(self, obj):
+        return dependencias_asignatura(obj)
 
     def get_queryset(self):
-        queryset = Asignatura.objects.all()
+        queryset = Asignatura.objects.all().order_by('id')
         programa_id = self.request.query_params.get('programa')
         semestre    = self.request.query_params.get('semestre')
         if programa_id:
@@ -90,10 +177,14 @@ class AsignaturaViewSet(viewsets.ModelViewSet):
 # SALONES
 # ─────────────────────────────────────────────
 
-class SalonViewSet(viewsets.ModelViewSet):
-    queryset = Salon.objects.all()
+class SalonViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
+    queryset = Salon.objects.all().order_by('id')
     serializer_class = SalonSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsTIOrReadOnly]
+    modelo_auditoria = 'Salon'
+
+    def dependencias(self, obj):
+        return dependencias_salon(obj)
 
 
 # ─────────────────────────────────────────────
@@ -346,10 +437,11 @@ class HorarioViewSet(viewsets.ModelViewSet):
 # MATRÍCULAS
 # ─────────────────────────────────────────────
 
-class MatriculaViewSet(viewsets.ModelViewSet):
-    queryset = Matricula.objects.all()
+class MatriculaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
+    queryset = Matricula.objects.all().order_by('id')
     serializer_class = MatriculaSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [MatriculaPermission]
+    modelo_auditoria = 'Matricula'
 
     def create(self, request, *args, **kwargs):
         estudiante_id  = request.data.get('estudiante')
