@@ -1002,7 +1002,7 @@ class TestRestriccionesDocumento(HorarioTestBase):
                                       hora_inicio=time(ini, 0), hora_fin=time(fin, 0),
                                       salon=Salon.objects.create(codigo=f'S{i}{j}', capacidad=30,
                                                                  edificio='Z'))
-        resp = self._post(dia='LUN', hora_inicio='16:00:00', hora_fin='17:00:00',
+        resp = self._post(dia='LUN', hora_inicio='16:00:00', hora_fin='18:00:00',
                           asignatura=self.asignatura2.pk, semestre='1')
         self.assertEqual(resp.status_code, 400)
         self.assertIn('LIMITE_HORAS_SEMANA', self._tipos(resp))
@@ -1041,8 +1041,296 @@ class TestRestriccionesDocumento(HorarioTestBase):
 
     # -- asignatura: horas obligatorias al crear ----------------------------
     def test_asignatura_exige_horas_semana_al_crear(self):
+        ti = Usuario.objects.create_user(username='ti_x', email='tix@ucundinamarca.edu.co',
+                                         password='Abc12345', rol='TI')
+        self.client.force_authenticate(user=ti)
         base = {'codigo': 'N1', 'nombre': 'Nuevo', 'programa': self.programa.pk,
                 'creditos': 3, 'semestre': '1', 'gestores': []}
         self.assertEqual(self.client.post(reverse('asignatura-list'), base, format='json').status_code, 400)
         base['horas_semana'] = 4
         self.assertEqual(self.client.post(reverse('asignatura-list'), base, format='json').status_code, 201)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. CRUD administrativo (rol TI) y permisos de escritura
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCRUDAdministrativo(HorarioTestBase):
+    def setUp(self):
+        super().setUp()
+        self.ti = Usuario.objects.create_user(
+            username='ti1', email='ti1@ucundinamarca.edu.co', password='Admin123', rol='TI')
+        self.est = Usuario.objects.create_user(
+            username='est1', email='est1@ucundinamarca.edu.co', password='Estud123', rol='ES')
+        self.est2 = Usuario.objects.create_user(
+            username='est2', email='est2@ucundinamarca.edu.co', password='Estud123', rol='ES')
+
+    def como(self, user):
+        self.client.force_authenticate(user=user)
+
+    def usuario_payload(self, **kw):
+        d = {'username': 'nuevo', 'email': 'nuevo@ucundinamarca.edu.co',
+             'password': 'Clave123', 'rol': 'ES'}
+        d.update(kw)
+        return d
+
+    # ── Permisos ────────────────────────────────────────────────────────────
+    def test_lectura_abierta_y_escritura_exige_autenticacion(self):
+        for nombre in ('usuario', 'programa', 'salon', 'asignatura', 'matricula'):
+            self.assertEqual(self.client.get(reverse(f'{nombre}-list')).status_code, 200, nombre)
+            self.assertEqual(self.client.post(reverse(f'{nombre}-list'), {}, format='json').status_code,
+                             401, nombre)
+
+    def test_roles_no_ti_no_pueden_escribir_entidades_administrativas(self):
+        cuerpos = {
+            'usuario': self.usuario_payload(),
+            'programa': {'nombre': 'X', 'codigo': 'XX1', 'coordinador': self.coordinador.pk},
+            'salon': {'codigo': 'Z1', 'capacidad': 20, 'edificio': 'G'},
+            'asignatura': {'codigo': 'Z9', 'nombre': 'Z', 'programa': self.programa.pk,
+                           'creditos': 2, 'horas_semana': 2},
+        }
+        for user in (self.coordinador, self.gestor1, self.est):
+            self.como(user)
+            for nombre, cuerpo in cuerpos.items():
+                self.assertEqual(self.client.post(reverse(f'{nombre}-list'), cuerpo,
+                                                  format='json').status_code, 403, (user.rol, nombre))
+            self.assertEqual(self.client.delete(
+                reverse('salon-detail', args=[self.salon2.pk])).status_code, 403)
+        self.assertTrue(Salon.objects.filter(pk=self.salon2.pk).exists())
+
+    # ── Usuarios ────────────────────────────────────────────────────────────
+    def test_usuario_crud_completo(self):
+        self.como(self.ti)
+        r = self.client.post(reverse('usuario-list'), self.usuario_payload(), format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        uid = r.data['id']
+        self.assertNotIn('password', r.data)
+        u = Usuario.objects.get(pk=uid)
+        self.assertNotEqual(u.password, 'Clave123')
+        self.assertTrue(u.check_password('Clave123'))
+
+        self.assertEqual(self.client.get(reverse('usuario-detail', args=[uid])).data['username'], 'nuevo')
+        self.assertEqual(self.client.get(reverse('usuario-list') + '?rol=ES').status_code, 200)
+
+        # PATCH sin contraseña conserva la actual
+        r = self.client.patch(reverse('usuario-detail', args=[uid]),
+                              {'first_name': 'Ana'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        u.refresh_from_db()
+        self.assertEqual(u.first_name, 'Ana')
+        self.assertTrue(u.check_password('Clave123'))
+
+        # PUT sin contraseña también funciona
+        r = self.client.put(reverse('usuario-detail', args=[uid]),
+                            {'username': 'nuevo', 'email': 'nuevo@ucundinamarca.edu.co', 'rol': 'ES'},
+                            format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+
+        # Cambio de contraseña: queda con hash
+        r = self.client.patch(reverse('usuario-detail', args=[uid]),
+                              {'password': 'Otra1234'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        u.refresh_from_db()
+        self.assertTrue(u.check_password('Otra1234'))
+        self.assertNotEqual(u.password, 'Otra1234')
+
+        self.assertEqual(self.client.delete(reverse('usuario-detail', args=[uid])).status_code, 204)
+        self.assertFalse(Usuario.objects.filter(pk=uid).exists())
+
+    def test_usuario_validaciones(self):
+        self.como(self.ti)
+        url = reverse('usuario-list')
+        r = self.client.post(url, self.usuario_payload(password=''), format='json')
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(url, {k: v for k, v in self.usuario_payload().items() if k != 'password'},
+                             format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('password', r.data)
+        r = self.client.post(url, self.usuario_payload(email='x@gmail.com'), format='json')
+        self.assertEqual(r.status_code, 400)
+        # username y correo duplicados
+        r = self.client.post(url, self.usuario_payload(username='gestor1'), format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('username', r.data)
+        r = self.client.post(url, self.usuario_payload(email='gestor1@ucundinamarca.edu.co'), format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('email', r.data)
+        # editar sin cambiar el propio correo no es duplicado
+        r = self.client.patch(reverse('usuario-detail', args=[self.gestor1.pk]),
+                              {'email': 'gestor1@ucundinamarca.edu.co'}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+
+    def test_usuario_con_dependencias_no_se_elimina_ni_cambia_de_rol(self):
+        self.como(self.ti)
+        self.crear_horario_db()                       # gestor1 con horario
+        r = self.client.delete(reverse('usuario-detail', args=[self.gestor1.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.data['codigo'], 'ELIMINACION_BLOQUEADA')
+        self.assertEqual(r.data['dependencias']['horarios_como_gestor'], 1)
+        self.assertTrue(Horario.objects.exists())     # nada se borró en cascada
+
+        r = self.client.patch(reverse('usuario-detail', args=[self.gestor1.pk]),
+                              {'rol': 'ES'}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('rol', r.data)
+
+        # coordinador de un programa
+        r = self.client.delete(reverse('usuario-detail', args=[self.coordinador.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertIn('programas_coordinados', r.data['dependencias'])
+
+    def test_ti_no_puede_eliminarse_a_si_mismo(self):
+        self.como(self.ti)
+        r = self.client.delete(reverse('usuario-detail', args=[self.ti.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertTrue(Usuario.objects.filter(pk=self.ti.pk).exists())
+
+    # ── Programas ───────────────────────────────────────────────────────────
+    def test_programa_crud_y_validaciones(self):
+        self.como(self.ti)
+        coord2 = Usuario.objects.create_user(username='coord9', email='c9@ucundinamarca.edu.co',
+                                             password='Coord123', rol='CO')
+        body = {'nombre': 'Ing. Ambiental', 'codigo': 'IAMB', 'coordinador': coord2.pk}
+        r = self.client.post(reverse('programa-list'), body, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        pid = r.data['id']
+        # código duplicado
+        self.assertEqual(self.client.post(reverse('programa-list'), body, format='json').status_code, 400)
+        # el coordinador debe tener rol CO
+        r = self.client.post(reverse('programa-list'),
+                             {'nombre': 'P', 'codigo': 'P2', 'coordinador': self.gestor1.pk}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('coordinador', r.data)
+        # coordinador inexistente
+        r = self.client.post(reverse('programa-list'),
+                             {'nombre': 'P', 'codigo': 'P3', 'coordinador': 99999}, format='json')
+        self.assertEqual(r.status_code, 400)
+        # actualizar
+        r = self.client.patch(reverse('programa-detail', args=[pid]), {'nombre': 'Ambiental'}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.client.get(reverse('programa-detail', args=[pid])).data['nombre'], 'Ambiental')
+        # eliminar (sin dependencias)
+        self.assertEqual(self.client.delete(reverse('programa-detail', args=[pid])).status_code, 204)
+
+    def test_programa_con_asignaturas_no_se_elimina(self):
+        self.como(self.ti)
+        r = self.client.delete(reverse('programa-detail', args=[self.programa.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertIn('asignaturas', r.data['dependencias'])
+        self.assertTrue(Asignatura.objects.filter(pk=self.asignatura1.pk).exists())
+
+    # ── Salones ─────────────────────────────────────────────────────────────
+    def test_salon_crud_y_validaciones(self):
+        self.como(self.ti)
+        body = {'codigo': 'Z-101', 'capacidad': 30, 'edificio': 'Z', 'tipo': 'COMP'}
+        r = self.client.post(reverse('salon-list'), body, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        sid = r.data['id']
+        self.assertEqual(r.data['tipo'], 'COMP')
+        self.assertEqual(self.client.post(reverse('salon-list'), body, format='json').status_code, 400)
+        self.assertEqual(self.client.post(reverse('salon-list'),
+                         {**body, 'codigo': 'Z-102', 'capacidad': 5}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(reverse('salon-detail', args=[sid]),
+                         {'capacidad': 40}, format='json').status_code, 200)
+        self.assertEqual(self.client.delete(reverse('salon-detail', args=[sid])).status_code, 204)
+
+    def test_salon_con_horarios_no_se_elimina_ni_queda_incompatible(self):
+        self.como(self.ti)
+        self.crear_horario_db()                       # salon1
+        r = self.client.delete(reverse('salon-detail', args=[self.salon1.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.data['dependencias']['horarios'], 1)
+        # bajar la capacidad por debajo de los matriculados del núcleo programado
+        for i in range(12):
+            e = Usuario.objects.create_user(username=f'm{i}', email=f'm{i}@ucundinamarca.edu.co',
+                                            password='Abc12345', rol='ES')
+            Matricula.objects.create(estudiante=e, asignatura=self.asignatura1, semestre='1')
+        r = self.client.patch(reverse('salon-detail', args=[self.salon1.pk]),
+                              {'capacidad': 10}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('salon', r.data)
+
+    # ── Asignaturas (núcleos temáticos) ─────────────────────────────────────
+    def test_asignatura_crud_y_validaciones(self):
+        self.como(self.ti)
+        body = {'codigo': 'N-1', 'nombre': 'Nuevo núcleo', 'programa': self.programa.pk,
+                'creditos': 3, 'horas_semana': 4, 'semestre': '2', 'gestores': [self.gestor1.pk]}
+        r = self.client.post(reverse('asignatura-list'), body, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        aid = r.data['id']
+        self.assertEqual(self.client.post(reverse('asignatura-list'), body, format='json').status_code, 400)
+        # programa inexistente / gestor que no es GC
+        self.assertEqual(self.client.post(reverse('asignatura-list'),
+                         {**body, 'codigo': 'N-2', 'programa': 99999}, format='json').status_code, 400)
+        self.assertEqual(self.client.post(reverse('asignatura-list'),
+                         {**body, 'codigo': 'N-3', 'gestores': [self.est.pk]}, format='json').status_code, 400)
+        # PUT sin horas_semana (núcleos antiguos) sigue siendo válido
+        put = {k: v for k, v in body.items() if k != 'horas_semana'}
+        put['nombre'] = 'Renombrado'
+        r = self.client.put(reverse('asignatura-detail', args=[aid]), put, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(self.client.delete(reverse('asignatura-detail', args=[aid])).status_code, 204)
+
+    def test_asignatura_con_horarios_o_matriculas_no_se_elimina(self):
+        self.como(self.ti)
+        self.crear_horario_db()
+        r = self.client.delete(reverse('asignatura-detail', args=[self.asignatura1.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.data['dependencias']['horarios'], 1)
+        Matricula.objects.create(estudiante=self.est, asignatura=self.asignatura2, semestre='1')
+        r = self.client.delete(reverse('asignatura-detail', args=[self.asignatura2.pk]))
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.data['dependencias']['matriculas'], 1)
+
+    # ── Matrículas ──────────────────────────────────────────────────────────
+    def test_matricula_crud_ti(self):
+        self.como(self.ti)
+        body = {'estudiante': self.est.pk, 'asignatura': self.asignatura1.pk, 'semestre': '1'}
+        r = self.client.post(reverse('matricula-list'), body, format='json')
+        self.assertEqual(r.status_code, 201, r.data)
+        mid = r.data['id']
+        self.assertEqual(self.client.post(reverse('matricula-list'), body, format='json').status_code, 400)
+        # PUT con los mismos datos no se rechaza por "duplicarse consigo misma"
+        self.assertEqual(self.client.put(reverse('matricula-detail', args=[mid]),
+                                         body, format='json').status_code, 200)
+        r = self.client.patch(reverse('matricula-detail', args=[mid]),
+                              {'asignatura': self.asignatura2.pk}, format='json')
+        self.assertEqual(r.status_code, 200, r.data)
+        # el estudiante debe tener rol ES
+        r = self.client.post(reverse('matricula-list'),
+                             {**body, 'estudiante': self.gestor1.pk}, format='json')
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.delete(reverse('matricula-detail', args=[mid])).status_code, 204)
+
+    def test_matricula_permisos_por_rol(self):
+        body = {'estudiante': self.est.pk, 'asignatura': self.asignatura1.pk, 'semestre': '1'}
+        self.como(self.est)
+        self.assertEqual(self.client.post(reverse('matricula-list'), body, format='json').status_code, 201)
+        # no puede matricular a otro estudiante
+        self.assertEqual(self.client.post(reverse('matricula-list'),
+                         {**body, 'estudiante': self.est2.pk}, format='json').status_code, 403)
+        m_otro = Matricula.objects.create(estudiante=self.est2, asignatura=self.asignatura2, semestre='1')
+        self.assertEqual(self.client.delete(reverse('matricula-detail', args=[m_otro.pk])).status_code, 403)
+        self.assertEqual(self.client.patch(reverse('matricula-detail', args=[m_otro.pk]),
+                         {'semestre': '2'}, format='json').status_code, 403)
+        propia = Matricula.objects.get(estudiante=self.est)
+        self.assertEqual(self.client.delete(reverse('matricula-detail', args=[propia.pk])).status_code, 204)
+        # gestor: sin escritura; coordinador: sí
+        self.como(self.gestor1)
+        self.assertEqual(self.client.post(reverse('matricula-list'), body, format='json').status_code, 403)
+        self.como(self.coordinador)
+        self.assertEqual(self.client.post(reverse('matricula-list'), body, format='json').status_code, 201)
+
+    # ── Auditoría ───────────────────────────────────────────────────────────
+    def test_crud_queda_registrado_en_auditoria(self):
+        from .models import RegistroAuditoria
+        self.como(self.ti)
+        r = self.client.post(reverse('salon-list'),
+                             {'codigo': 'AU-1', 'capacidad': 20, 'edificio': 'A'}, format='json')
+        sid = r.data['id']
+        self.client.patch(reverse('salon-detail', args=[sid]), {'capacidad': 25}, format='json')
+        self.client.delete(reverse('salon-detail', args=[sid]))
+        acciones = list(RegistroAuditoria.objects.filter(modelo='Salon', objeto_id=sid)
+                        .order_by('id').values_list('accion', flat=True))
+        self.assertEqual(acciones, ['CREATE', 'UPDATE', 'DELETE'])
+        self.assertEqual(RegistroAuditoria.objects.filter(modelo='Salon').first().usuario, self.ti)
