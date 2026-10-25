@@ -113,7 +113,10 @@ class HorarioTestBase(APITestCase):
             edificio='Bloque B',
         )
 
+        # Los endpoints de horarios exigen JWT: por defecto se actúa como el coordinador
+        # del programa (cada prueba puede cambiar de usuario con force_authenticate).
         self.client = APIClient()
+        self.client.force_authenticate(user=self.coordinador)
 
     def crear_horario_db(self, asignatura=None, salon=None, gestor=None,
                          dia='LUN', hora_inicio=time(7, 0), hora_fin=time(9, 0),
@@ -734,6 +737,7 @@ class TestAuditoriaEndpoints(HorarioTestBase):
         )
 
     def test_auditoria_acceso_no_autenticado_denegado(self):
+        self.client.force_authenticate(user=None)
         resp = self.client.get('/api/auditoria/')
         self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
 
@@ -1076,8 +1080,13 @@ class TestCRUDAdministrativo(HorarioTestBase):
 
     # ── Permisos ────────────────────────────────────────────────────────────
     def test_lectura_abierta_y_escritura_exige_autenticacion(self):
+        self.client.force_authenticate(user=None)
+        # Programas y asignaturas (con alcance por programa) exigen sesión también para leer.
+        for nombre in ('programa', 'asignatura'):
+            self.assertEqual(self.client.get(reverse(f'{nombre}-list')).status_code, 401, nombre)
         for nombre in ('usuario', 'programa', 'salon', 'asignatura', 'matricula'):
-            self.assertEqual(self.client.get(reverse(f'{nombre}-list')).status_code, 200, nombre)
+            if nombre not in ('programa', 'asignatura'):
+                self.assertEqual(self.client.get(reverse(f'{nombre}-list')).status_code, 200, nombre)
             self.assertEqual(self.client.post(reverse(f'{nombre}-list'), {}, format='json').status_code,
                              401, nombre)
 
