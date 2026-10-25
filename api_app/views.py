@@ -3,7 +3,7 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.response import Response
 from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -22,7 +22,13 @@ from .serializers import (
 )
 from django.contrib.auth import authenticate
 from api_app.utils import registrar_auditoria
-from api_app.permissions import IsTIOrReadOnly, MatriculaPermission
+from api_app.permissions import (
+    IsTIOrReadOnly, MatriculaPermission, AutenticadoLecturaTIEscritura, HorarioPermission,
+)
+from api_app.services.alcance_programa import (
+    filtrar_programas, filtrar_asignaturas, filtrar_horarios,
+    exigir_asignatura_propia, sanitizar_conflictos,
+)
 from api_app.services.dependencias import (
     dependencias_usuario, dependencias_programa, dependencias_asignatura,
     dependencias_salon, describir,
@@ -141,10 +147,13 @@ class UsuarioViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
 # ─────────────────────────────────────────────
 
 class ProgramaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
-    queryset = Programa.objects.all().order_by('id')
     serializer_class = ProgramaSerializer
-    permission_classes = [IsTIOrReadOnly]
+    permission_classes = [AutenticadoLecturaTIEscritura]
     modelo_auditoria = 'Programa'
+
+    def get_queryset(self):
+        # CO: solo el programa que coordina (detalle ajeno -> 404). TI/otros: todos.
+        return filtrar_programas(Programa.objects.all().order_by('id'), self.request.user)
 
     def dependencias(self, obj):
         return dependencias_programa(obj)
@@ -156,14 +165,16 @@ class ProgramaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
 
 class AsignaturaViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
     serializer_class = AsignaturaSerializer
-    permission_classes = [IsTIOrReadOnly]
+    permission_classes = [AutenticadoLecturaTIEscritura]
     modelo_auditoria = 'Asignatura'
 
     def dependencias(self, obj):
         return dependencias_asignatura(obj)
 
     def get_queryset(self):
-        queryset = Asignatura.objects.all().order_by('id')
+        # El alcance del CO se aplica ANTES de los parámetros de consulta, de modo que
+        # `?programa=<otro>` solo puede reducir el resultado, nunca ampliarlo.
+        queryset = filtrar_asignaturas(Asignatura.objects.all().order_by('id'), self.request.user)
         programa_id = self.request.query_params.get('programa')
         semestre    = self.request.query_params.get('semestre')
         if programa_id:
@@ -193,13 +204,11 @@ class SalonViewSet(AdminCRUDMixin, viewsets.ModelViewSet):
 
 class HorarioViewSet(viewsets.ModelViewSet):
     serializer_class = HorarioSerializer
-    # ── AllowAny mientras no tengas autenticación por token en Flutter.
-    #    Cuando implementes login con token, cambia a:
-    #    permission_classes = [permissions.IsAuthenticated, IsCoordinador | IsGestor]
-    permission_classes = [AllowAny]
+    # Requiere autenticación (JWT). El CO solo ve/modifica horarios de su programa.
+    permission_classes = [HorarioPermission]
 
     def get_queryset(self):
-        queryset = Horario.objects.all()
+        queryset = filtrar_horarios(Horario.objects.all(), self.request.user)
         dia        = self.request.query_params.get('dia')
         gestor     = self.request.query_params.get('gestor')
         asignatura = self.request.query_params.get('asignatura')
@@ -290,8 +299,8 @@ class HorarioViewSet(viewsets.ModelViewSet):
             )
         # Filtra por el campo semestre del propio modelo Horario
         # (más confiable que depender del semestre en Asignatura)
-        horarios = Horario.objects.filter(
-            semestre=semestre
+        horarios = filtrar_horarios(
+            Horario.objects.filter(semestre=semestre), request.user
         ).select_related('asignatura', 'gestor', 'salon')
 
         # Agrupar por día para devolver estructura conveniente
@@ -369,11 +378,13 @@ class HorarioViewSet(viewsets.ModelViewSet):
             semestre      = data.get('semestre', '')
             horario_id    = data.get('horario_id') or data.get('excluir_id')  # para excluir al editar
 
-            horario_instancia = Horario.objects.filter(pk=horario_id).first() if horario_id else None
+            # Se busca dentro del queryset con alcance: un CO no puede sondear horarios ajenos.
+            horario_instancia = self.get_queryset().filter(pk=horario_id).first() if horario_id else None
 
             asignatura = Asignatura.objects.get(pk=asignatura_id) if asignatura_id else (
                 horario_instancia.asignatura if horario_instancia else None
             )
+            exigir_asignatura_propia(request.user, asignatura)
             salon      = Salon.objects.get(pk=salon_id) if salon_id else (
                 horario_instancia.salon if horario_instancia else None
             )
@@ -427,8 +438,8 @@ class HorarioViewSet(viewsets.ModelViewSet):
 
         return Response({
             'valido':       len(resultado['errores']) == 0,
-            'conflictos':   resultado['errores'],       # restricciones duras
-            'advertencias': resultado['advertencias'],  # restricciones blandas
+            'conflictos':   sanitizar_conflictos(resultado['errores'], request.user),       # duras
+            'advertencias': sanitizar_conflictos(resultado['advertencias'], request.user),  # blandas
             'resumen':      resultado['resumen'],       # horas asignadas / carga del gestor
         }, status=status.HTTP_200_OK)
 
@@ -537,14 +548,14 @@ class ConfiguracionUsuarioViewSet(viewsets.ModelViewSet):
 # ─────────────────────────────────────────────
 
 class BuscadorViewSet(viewsets.ViewSet):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     @action(detail=False, methods=['get'])
     def buscar_asignaturas(self, request):
         query = request.query_params.get('q', '')
-        asignaturas = Asignatura.objects.filter(
+        asignaturas = filtrar_asignaturas(Asignatura.objects.filter(
             Q(nombre__icontains=query) | Q(codigo__icontains=query)
-        )
+        ), request.user)
         return Response(AsignaturaSerializer(asignaturas, many=True).data)
 
 

@@ -255,6 +255,14 @@ class HorarioSerializer(serializers.ModelSerializer):
                 'salon': 'El campo salon es obligatorio y no puede ser nulo.'
             })
 
+        # Alcance por programa: un CO solo puede programar asignaturas de su programa
+        # (el salón y el gestor son recursos compartidos y no se restringen por programa).
+        request = self.context.get('request')
+        usuario = getattr(request, 'user', None)
+        if usuario is not None:
+            from api_app.services.alcance_programa import exigir_asignatura_propia
+            exigir_asignatura_propia(usuario, asignatura)
+
         resultado = evaluar_horario(
             asignatura  = asignatura,
             salon       = salon,
@@ -270,8 +278,9 @@ class HorarioSerializer(serializers.ModelSerializer):
         # Solo las restricciones DURAS bloquean el guardado; las blandas
         # (almuerzo, ventanas, carga equilibrada) se consultan en /horarios/validar/.
         if resultado['errores']:
+            from api_app.services.alcance_programa import sanitizar_conflictos
             raise serializers.ValidationError({
-                'conflictos': resultado['errores'],
+                'conflictos': sanitizar_conflictos(resultado['errores'], usuario),
             })
 
         # El semestre del bloque es el del núcleo cuando el cliente no lo envía.
